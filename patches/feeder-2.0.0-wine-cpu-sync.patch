@@ -1,0 +1,549 @@
+diff --git a/host/dlss5-feed-host64.cpp b/host/dlss5-feed-host64.cpp
+index a027377..7134c53 100644
+--- a/host/dlss5-feed-host64.cpp
++++ b/host/dlss5-feed-host64.cpp
+@@ -1034,6 +1034,8 @@ struct Host
+     bool            async_home;    // FEED_BUILD_ASYNC_HOME: the client copies home the PREVIOUS frame's
+                                    // result, so it is never blocked behind the evaluate running now. Lets
+                                    // PumpPresent retire a skipped present instead of dropping it (#15).
++    bool            cpu_sync;      // FEED_BUILD_CPU_SYNC: the client opened neither fence (Wine, #121).
++                                   // No Wait(fence_in); each finished frame is published by CpuSyncPublish.
+ 
+     // v7: the panel texture -- the GAME's D3D11 texture (this driver refuses the other
+     // direction), opened here, into which the frame this window just presented is copied
+@@ -1188,6 +1190,52 @@ static bool WaitFenceValue(ID3D12Fence *f, UINT64 v, DWORD ms)
+     return WaitForSingleObject(h.fence_event, ms) == WAIT_OBJECT_0 && f->GetCompletedValue() >= v;
+ }
+ 
++// FEED_BUILD_CPU_SYNC (#121): the CPU-side stand-in for fence_out. Created once per host
++// process; a respawned host reopens the same names if the game still holds them.
++static HANDLE       g_sync_map, g_sync_evt;
++static FeedCpuSync *g_sync;
++
++static bool CpuSyncOpen(DWORD game_pid)
++{
++    if (g_sync != nullptr) return true;
++    wchar_t name[64];
++    swprintf_s(name, FEED_SYNC_MAP_FMT, static_cast<unsigned long>(game_pid));
++    g_sync_map = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(FeedCpuSync), name);
++    if (g_sync_map != nullptr)
++        g_sync = static_cast<FeedCpuSync *>(MapViewOfFile(g_sync_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FeedCpuSync)));
++    swprintf_s(name, FEED_SYNC_EVT_FMT, static_cast<unsigned long>(game_pid));
++    g_sync_evt = CreateEventW(nullptr, FALSE, FALSE, name);
++    if (g_sync == nullptr || g_sync_evt == nullptr)
++    {
++        Log("[host] cpu sync: could not create the shared counter/event (error %lu)", GetLastError());
++        if (g_sync != nullptr) UnmapViewOfFile(g_sync);
++        if (g_sync_map != nullptr) CloseHandle(g_sync_map);
++        if (g_sync_evt != nullptr) CloseHandle(g_sync_evt);
++        g_sync = nullptr; g_sync_map = g_sync_evt = nullptr;
++        return false;
++    }
++    // A section the game still holds from the previous host would carry its exit value
++    // (UINT64_MAX) and satisfy every wait. The client's frame numbers only ever grow, so
++    // starting this session from zero is always safe.
++    InterlockedExchange64(reinterpret_cast<volatile LONG64 *>(&g_sync->done_n), 0);
++    return true;
++}
++
++// Tell a cpu_sync client that frame n is finished (or, with UINT64_MAX, that nothing it
++// waits on will ever come). Never moves the counter backwards.
++static void CpuSyncPublish(UINT64 n)
++{
++    if (!h.cpu_sync || g_sync == nullptr) return;
++    for (;;)
++    {
++        const LONG64 cur = static_cast<LONG64>(g_sync->done_n);
++        if (static_cast<UINT64>(cur) >= n) break;
++        if (InterlockedCompareExchange64(reinterpret_cast<volatile LONG64 *>(&g_sync->done_n),
++                                         static_cast<LONG64>(n), cur) == cur) break;
++    }
++    SetEvent(g_sync_evt);
++}
++
+ static void CloseListGuarded()
+ {
+     __try { h.list->Close(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+@@ -3582,6 +3630,12 @@ static int Serve(DWORD game_pid)
+                     ? "pipelined (async_home=1): a present DWM defers is retired from the idle path"
+                     : "same frame (async_home=0): a present DWM defers is dropped");
+             }
++            const bool was_cpu_sync = h.cpu_sync;
++            h.cpu_sync = (b.client_flags & FEED_BUILD_CPU_SYNC) != 0 && CpuSyncOpen(game_pid);
++            if (h.cpu_sync != was_cpu_sync)
++                Log("[host] cpu sync: %s", h.cpu_sync
++                    ? "on -- the client opens no fence (Wine, #121); each evaluate is CPU-waited and published"
++                    : "off");
+             if (d3d11_opener)
+                 Log("[host] the game's D3D11 device could not create the shared set; creating it here%s",
+                     no_uav ? " with the DLSS output's UAV kept on this side" : "");
+@@ -3799,6 +3853,7 @@ static int Serve(DWORD game_pid)
+             back.ngx_result = static_cast<uint32_t>(rf);
+             if (sr_unavailable)   back.flags |= FEED_ACK_SR_UNAVAILABLE;
+             else if (ok && want_sr) { back.flags |= FEED_ACK_SR_ACTIVE; back.sr_quality = static_cast<uint32_t>(h.sr_quality); }
++            if (h.cpu_sync)         back.flags |= FEED_ACK_CPU_SYNC;
+             back.fence_in   = reinterpret_cast<uint64_t>(game_in);
+             back.fence_out  = reinterpret_cast<uint64_t>(game_out);
+             back.output_fmt = static_cast<uint32_t>(out_fmt);
+@@ -3914,6 +3969,7 @@ static int Serve(DWORD game_pid)
+             if (h.feature == nullptr && !transport_only)
+             {
+                 h.fence_out->Signal(fm.n);
++                CpuSyncPublish(fm.n);
+                 PumpPresent();
+                 if (g_device_removed) break;
+                 continue;
+@@ -3925,7 +3981,9 @@ static int Serve(DWORD game_pid)
+             // (issue #15). A game whose GPU never reaches fm.n now surfaces three frames
+             // later as BeginCommands' allocator-retire timeout, which fails the evaluate
+             // and CPU-signals fence_out below -- the never-hang guarantee is unchanged.
+-            h.queue->Wait(h.fence_in, fm.n);
++            // cpu_sync: the client drained its copies before writing this message and never
++            // signals fence_in, so there is nothing to order behind (and waiting would hang).
++            if (!h.cpu_sync) h.queue->Wait(h.fence_in, fm.n);
+ 
+             bool done = false;
+             if (transport_only)
+@@ -3970,6 +4028,16 @@ static int Serve(DWORD game_pid)
+             if (done)
+             {
+                 h.queue->Signal(h.fence_out, fm.n);
++                if (h.cpu_sync)
++                {
++                    // The client reads Output as soon as the counter moves, so the evaluate
++                    // has to be finished on the GPU first, not just queued. A wait that times
++                    // out still publishes: the client must never hang on us.
++                    if (!WaitFenceValue(h.fence_out, fm.n, 2000))
++                        Log("[host] cpu sync: frame %llu did not finish within 2 s; releasing the client anyway",
++                            static_cast<unsigned long long>(fm.n));
++                    CpuSyncPublish(fm.n);
++                }
+                 if (!transport_only && !outcome_logged && ++outcome_frames >= 300)
+                 {
+                     outcome_logged = true;
+@@ -4013,6 +4081,7 @@ static int Serve(DWORD game_pid)
+             else
+             {
+                 h.fence_out->Signal(fm.n);     // CPU-signal so the game never hangs on us
++                CpuSyncPublish(fm.n);
+                 if (DeviceRemoved("an evaluate")) break;
+             }
+ 
+@@ -4104,6 +4173,7 @@ static int Serve(DWORD game_pid)
+     CloseHandle(ev_tag);
+     if (!g_device_removed) WaitFenceValue(h.fence, h.fence_value, 2000);   // nothing to wait for on a dead device
+     if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
++    CpuSyncPublish(UINT64_MAX);
+     Log("[host] pending game fence waits released; exiting%s", g_device_removed ? " (device removed)" : "");
+     return g_device_removed ? 3 : 0;
+ }
+diff --git a/src/dlss5-feed32.cpp b/src/dlss5-feed32.cpp
+index 966b164..a3c01d8 100644
+--- a/src/dlss5-feed32.cpp
++++ b/src/dlss5-feed32.cpp
+@@ -412,12 +412,13 @@ struct Cfg
+                            // which is L (kDefaultPreset; see the 64-bit add-on for why), 5 = E, 6 = F
+                            // (legacy CNN), 10 = J, 11 = K, 12 = L, 13 = M. Sent to the host in FeedBuild
+                            // (v12), always as a number the host can pass on; changing it rebuilds the feature.
++    int   wine_cpu_sync;   // #121: 1 = under Wine use the fence-free CPU handoff, 0 = off, 2 = force.
+ };
+ 
+ //                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
+ static const uint32_t kDefaultPreset = 12;   // L
+ static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
+-                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1, /* preset */ 0 };
++                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f, /* d3d10_pipeline */ 1, /* preset */ 0, /* wine_cpu_sync */ 1 };
+ static int       g_work_resolution_ui = 100;
+ static int       g_pending_work_resolution = 0;
+ static ULONGLONG g_work_resolution_apply_after = 0;
+@@ -624,6 +625,7 @@ static bool CfgReload()   // true when a build-affecting value changed
+         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
+         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
+         else if (_stricmp(key, "wine_fence_import") == 0) next.wine_fence_import = iv == 1 ? 1 : 0;
++        else if (_stricmp(key, "wine_cpu_sync")  == 0) next.wine_cpu_sync  = iv < 0 ? 0 : iv > 2 ? 2 : iv;
+         else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv < 0 ? 0 : iv > 8 ? 8 : iv;
+         else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
+         else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
+@@ -647,12 +649,12 @@ static bool CfgReload()   // true when a build-affecting value changed
+         // what they had set (issue #15). The 64-bit side has always printed its full set.
+         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
+             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
+-            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f d3d10_pipeline=%d preset=%d",
++            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f d3d10_pipeline=%d preset=%d wine_cpu_sync=%d",
+             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
+             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
+             g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates, g_cfg.wine_fence_import, g_cfg.settle_evals,
+-            g_cfg.hold_strength, g_cfg.hold_tolerance, g_cfg.d3d10_pipeline, g_cfg.preset);
++            g_cfg.hold_strength, g_cfg.hold_tolerance, g_cfg.d3d10_pipeline, g_cfg.preset, g_cfg.wine_cpu_sync);
+     }
+     return rebuild;
+ }
+@@ -787,6 +789,13 @@ struct Feed32
+     ID3D11Device    *dev;         // not owned
+     ID3D11Multithread *mt;        // immediate-context serialization, restored on teardown
+     bool             mt_was_on;   // what the game had set before we turned it on
++    // wine_cpu_sync (#121): the D3D11 client's fence-free handoff. When cpu_sync is set, fence_in
++    // and fence_out above stay null for the whole host session and fence_wait_queued never rises.
++    bool             cpu_sync_asked;  // the build in flight carries FEED_BUILD_CPU_SYNC
++    bool             cpu_sync;    // asked for in this session's build AND acknowledged (FEED_ACK_CPU_SYNC)
++    HANDLE           sync_map, sync_evt;   // host64's FeedCpuSync section and its done event
++    FeedCpuSync     *sync;
++    ID3D11Query     *sync_query;  // D3D11_QUERY_EVENT: the copies into the shared set have retired
+ 
+     // OpenGL client: the host creates the shared textures and duplicates the handles
+     // in; we import them raw (feed_gl.h) and never touch D3D11 at all. tex_handle[]
+@@ -1133,6 +1142,71 @@ static void CastHostLost();       // below: drop the thumbnail of a window that
+ static void CastReleasePanel();   // below: and our view of its panel texture
+ static void CastFlushInput();     // below: release any key/button the host still thinks is held
+ 
++// wine_cpu_sync=1 asks for the fence-free handoff only where the fences cannot work.
++static bool CpuSyncWanted()
++{
++    return g_cfg.wine_cpu_sync == 2 || (g_cfg.wine_cpu_sync == 1 && FeedGlWineVersion() != nullptr);
++}
++
++// wine_cpu_sync (#121): what stands in for fence_in/fence_out. All of it belongs to one host
++// session, exactly like the fences, and goes with them in HostClose.
++static void CpuSyncRelease()
++{
++    if (g.sync != nullptr)     { UnmapViewOfFile(g.sync); g.sync = nullptr; }
++    if (g.sync_map != nullptr) { CloseHandle(g.sync_map); g.sync_map = nullptr; }
++    if (g.sync_evt != nullptr) { CloseHandle(g.sync_evt); g.sync_evt = nullptr; }
++    SafeRelease(g.sync_query);
++    g.cpu_sync = false;
++}
++
++// Instead of Signal(fence_in, n): returns once everything queued on ctx so far has retired --
++// the copies into the shared set, and under async_home the read of Output. The host never
++// waits on the GPU for us, so this is what keeps it from reading half-written inputs.
++static bool CpuSyncDrain(ID3D11DeviceContext *ctx)
++{
++    ctx->End(g.sync_query);
++    ctx->Flush();
++    BOOL done = FALSE;
++    const ULONGLONG deadline = GetTickCount64() + 2000;
++    HRESULT hr;
++    while ((hr = ctx->GetData(g.sync_query, &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE)
++    {
++        if (GetTickCount64() > deadline) { Log("[feed32] cpu sync: the input copies did not retire within 2 s"); return false; }
++        SwitchToThread();
++    }
++    if (FAILED(hr)) Log("[feed32] cpu sync: event query failed 0x%08X", hr);
++    return SUCCEEDED(hr);
++}
++
++// The counter is 64-bit and the 32-bit add-on reads it too, where a plain load is two 32-bit
++// loads that can tear. A compare-exchange that never changes anything is an atomic read on both.
++static UINT64 CpuSyncDone()
++{
++    return static_cast<UINT64>(InterlockedCompareExchange64(reinterpret_cast<volatile LONG64 *>(&g.sync->done_n), 0, 0));
++}
++
++// Instead of Wait(fence_out, n): blocks until host64 says frame n is finished. The host only
++// publishes after its own CPU wait on its own fence_out, so Output is complete by then. False
++// on a host that died or went quiet; the caller treats that as a lost host.
++static bool CpuSyncWaitHost(UINT64 n)
++{
++    const ULONGLONG deadline = GetTickCount64() + 5000;
++    while (CpuSyncDone() < n)
++    {
++        const ULONGLONG now = GetTickCount64();
++        if (now >= deadline)
++        {
++            Log("[feed32] cpu sync: frame %llu not finished by the host within 5 s (host at %llu)",
++                static_cast<unsigned long long>(n), static_cast<unsigned long long>(CpuSyncDone()));
++            return false;
++        }
++        const HANDLE wait[2] = { g.sync_evt, g.hproc };
++        const DWORD r = WaitForMultipleObjects(2, wait, FALSE, static_cast<DWORD>(deadline - now));
++        if (r == WAIT_OBJECT_0 + 1 || r == WAIT_FAILED) return CpuSyncDone() >= n;
++    }
++    return true;
++}
++
+ static void HostClose()
+ {
+     // First: nothing else here may run beside a worker still using the pipe. When it says
+@@ -1185,6 +1259,7 @@ static void HostClose()
+     // reopen from the new host's BuildAck instead of waiting on dead fences forever.
+     SafeRelease(g.fence_in);
+     SafeRelease(g.fence_out);
++    CpuSyncRelease();
+     if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+     {
+         if (g.gl_sem_in  != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);  g.gl_sem_in  = 0; }
+@@ -3822,6 +3897,8 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
+     b.preset         = g_cfg.preset > 0 ? static_cast<uint32_t>(g_cfg.preset) : kDefaultPreset;
+     if (want_sr) { b.target_width = g.output_width; b.target_height = g.output_height; }
+     if (g_cfg.async_home) b.client_flags |= FEED_BUILD_ASYNC_HOME;
++    g.cpu_sync_asked = CpuSyncWanted();
++    if (g.cpu_sync_asked) b.client_flags |= FEED_BUILD_CPU_SYNC;
+     if (g.host_creates)
+         b.client_flags |= FEED_BUILD_HOST_CREATES | (g.no_uav ? FEED_BUILD_OUTPUT_NO_UAV : 0);
+     else
+@@ -3880,6 +3957,16 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
+         if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
+         return false;
+     }
++    if (g.cpu_sync_asked && (ack.flags & FEED_ACK_CPU_SYNC) == 0)
++    {
++        // An older host64 ignores the flag and would wait on a fence_in we never signal.
++        Log("[feed32] wine_cpu_sync: host64 did not acknowledge FEED_BUILD_CPU_SYNC (an older dlss5-feed-host64.exe?)");
++        if (ack.panel_tex != 0) CloseHandle(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.panel_tex)));
++        ReleaseShared();
++        FeedDisable("host64\\dlss5-feed-host64.exe does not support wine_cpu_sync (#121) -- install the matching one, "
++                    "or set wine_cpu_sync=0 to open its fences instead (which Wine cannot do)");
++        return false;
++    }
+ 
+     if (g.host_creates)
+     {
+@@ -4011,7 +4098,40 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
+             Log("[feed32] fsr1 intermediate (%ux%u fmt=%u) failed; work_upscale=1 falls back to bilinear", backbuffer_w, backbuffer_h, g.output_fmt);
+     }
+ 
+-    if (g.fence_in == nullptr || g.fence_out == nullptr)
++    g.cpu_sync = g.cpu_sync_asked;
++    if (g.cpu_sync)
++    {
++        // Under Wine, OpenSharedFence on a fence host64 made is the call that faults inside
++        // win32u (#121). Leave both handles unopened and use host64's counter and event.
++        if (g.sync == nullptr)
++        {
++            wchar_t name[64];
++            swprintf_s(name, FEED_SYNC_MAP_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
++            // Write access only because CpuSyncDone's atomic read is a locked compare-exchange.
++            g.sync_map = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name);
++            if (g.sync_map != nullptr)
++                g.sync = static_cast<FeedCpuSync *>(MapViewOfFile(g.sync_map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(FeedCpuSync)));
++            swprintf_s(name, FEED_SYNC_EVT_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
++            g.sync_evt = OpenEventW(SYNCHRONIZE, FALSE, name);
++            D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
++            if (g.sync != nullptr && g.sync_evt != nullptr)
++                g.dev->CreateQuery(&qd, &g.sync_query);
++            if (g.sync == nullptr || g.sync_evt == nullptr || g.sync_query == nullptr)
++            {
++                Log("[feed32] wine_cpu_sync: could not open host64's counter/event or create the event query (error %lu)",
++                    GetLastError());
++                CpuSyncRelease();
++                ReleaseShared();
++                FeedDisable("wine_cpu_sync could not be set up (see dlss5-feed.log)");
++                return false;
++            }
++            const char *wine = FeedGlWineVersion();
++            Log("[feed32] wine_cpu_sync: on%s%s -- host64's D3D12 fences are left unopened (#121); each frame is "
++                "handed over on the CPU (event query here, host64's own fence wait there)",
++                wine ? " under Wine " : " (forced, wine_cpu_sync=2)", wine ? wine : "");
++        }
++    }
++    else if (g.fence_in == nullptr || g.fence_out == nullptr)
+     {
+         ID3D11Device5 *dev5 = nullptr;
+         if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&dev5))) || dev5 == nullptr)
+@@ -5526,12 +5646,26 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
+         else
+         {
+             const bool async_home = g_cfg.async_home != 0;
++            bool host_ok = true;
+             if (async_home && g.sent_n != 0)
+             {
+                 Breadcrumb("waiting for the previous result");
+-                g.ctx4->Wait(g.fence_out, g.sent_n);
+-                g.fence_wait_queued = true;
+-                g.wait_n            = g.sent_n;
++                if (g.cpu_sync)
++                    host_ok = CpuSyncWaitHost(g.sent_n);
++                else
++                {
++                    g.ctx4->Wait(g.fence_out, g.sent_n);
++                    g.fence_wait_queued = true;
++                    g.wait_n            = g.sent_n;
++                }
++            }
++            if (!host_ok)
++            {
++                HostLost("no result from the host (wine_cpu_sync)");
++                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
++                QueryPerformanceCounter(&t1);
++                TimingTick(t0.QuadPart, t1.QuadPart);
++                return;
+             }
+ 
+             if (g.sr_active)
+@@ -5583,8 +5717,22 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
+             bool home_ok = true;
+             if (carried) home_ok = BlitHome10(color_res);
+ 
+-            g.ctx4->Signal(g.fence_in, n);
+-            ctx->Flush();
++            bool handed = true;
++            if (g.cpu_sync)
++                handed = CpuSyncDrain(ctx);
++            else
++            {
++                g.ctx4->Signal(g.fence_in, n);
++                ctx->Flush();
++            }
++            if (!handed)
++            {
++                FeedFail("wine_cpu_sync input drain");
++                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
++                QueryPerformanceCounter(&t1);
++                TimingTick(t0.QuadPart, t1.QuadPart);
++                return;
++            }
+ 
+             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
+                                       g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
+@@ -5612,11 +5760,17 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
+             else
+             {
+                 Breadcrumb("waiting for the host's result");
+-                g.ctx4->Wait(g.fence_out, n);
+-                g.fence_wait_queued = true;
+-                g.wait_n            = n;
+-                g.sent_n            = n;
+-                if (!BlitHome10(color_res)) FeedFail("D3D10 blit home");
++                if (g.cpu_sync)
++                    host_ok = CpuSyncWaitHost(n);
++                else
++                {
++                    g.ctx4->Wait(g.fence_out, n);
++                    g.fence_wait_queued = true;
++                    g.wait_n            = n;
++                }
++                g.sent_n = n;
++                if (!host_ok) HostLost("no result from the host (wine_cpu_sync)");
++                else if (!BlitHome10(color_res)) FeedFail("D3D10 blit home");
+                 else
+                 {
+                     g.out_valid = true;
+@@ -5755,12 +5909,26 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
+             // Depth and MV for that evaluate, and this is the only thing ordering our
+             // overwrite of them against it.
+             const bool async_home = g_cfg.async_home != 0;
++            bool host_ok = true;
+             if (async_home && g.sent_n != 0)
+             {
+                 Breadcrumb("waiting for the previous result");
+-                g.ctx4->Wait(g.fence_out, g.sent_n);   // GPU-side; the host CPU-signals on failure
+-                g.fence_wait_queued = true;
+-                g.wait_n            = g.sent_n;
++                if (g.cpu_sync)
++                    host_ok = CpuSyncWaitHost(g.sent_n);   // CPU-side: nothing GPU-side to queue it on
++                else
++                {
++                    g.ctx4->Wait(g.fence_out, g.sent_n);   // GPU-side; the host CPU-signals on failure
++                    g.fence_wait_queued = true;
++                    g.wait_n            = g.sent_n;
++                }
++            }
++            if (!host_ok)
++            {
++                HostLost("no result from the host (wine_cpu_sync)");
++                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
++                QueryPerformanceCounter(&t1);
++                TimingTick(t0.QuadPart, t1.QuadPart);
++                return;
+             }
+ 
+             // work_upscale=2: this frame's grid shift. The sequence restarts with the DLSS
+@@ -5795,8 +5963,22 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
+             const bool carried = async_home && g.out_valid;
+             if (carried) BlitOutputToBackbuffer(ctx, rtv11);
+ 
+-            g.ctx4->Signal(g.fence_in, n);
+-            ctx->Flush();
++            bool handed = true;
++            if (g.cpu_sync)
++                handed = CpuSyncDrain(ctx);   // the copies have landed before the host hears of frame n
++            else
++            {
++                g.ctx4->Signal(g.fence_in, n);
++                ctx->Flush();
++            }
++            if (!handed)
++            {
++                FeedFail("wine_cpu_sync input drain");
++                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
++                QueryPerformanceCounter(&t1);
++                TimingTick(t0.QuadPart, t1.QuadPart);
++                return;
++            }
+ 
+             // Jitter sign: the shift was applied to the sampling grid, so a sample sits at
+             // pixel centre + jitter -- the convention the SDK's jitter offset describes.
+@@ -5824,16 +6006,26 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
+             else
+             {
+                 Breadcrumb("waiting for the host's result");
+-                g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
+-                g.fence_wait_queued = true;         // HostDrain must resolve this before any close
+-                g.wait_n            = n;
+-                g.sent_n            = n;
+-                BlitOutputToBackbuffer(ctx, rtv11);
+-                g.out_valid = true;
+-                const UINT64 done = ++g.frames_done;
+-                g.consecutive_fails = 0;
+-                if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+-                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d)", done, g.width, g.height, reset);
++                if (g.cpu_sync)
++                    host_ok = CpuSyncWaitHost(n);   // host64 waited its own fence_out before saying so
++                else
++                {
++                    g.ctx4->Wait(g.fence_out, n);   // GPU-side; the host CPU-signals on failure
++                    g.fence_wait_queued = true;     // HostDrain must resolve this before any close
++                    g.wait_n            = n;
++                }
++                g.sent_n = n;
++                if (!host_ok)
++                    HostLost("no result from the host (wine_cpu_sync)");
++                else
++                {
++                    BlitOutputToBackbuffer(ctx, rtv11);
++                    g.out_valid = true;
++                    const UINT64 done = ++g.frames_done;
++                    g.consecutive_fails = 0;
++                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
++                        Log("[feed32] frame %llu delivered (%ux%u, reset=%d)", done, g.width, g.height, reset);
++                }
+             }
+         }
+     }
+diff --git a/src/feed_ipc.h b/src/feed_ipc.h
+index 11f2bb8..ea01430 100644
+--- a/src/feed_ipc.h
++++ b/src/feed_ipc.h
+@@ -107,13 +107,31 @@
+                                       // may spend a little of its OWN time getting a present slot rather
+                                       // than dropping the present (issue #15). An unset bit is the old
+                                       // behaviour on both sides, so this needs no FEED_IPC_VERSION bump.
++#define FEED_BUILD_CPU_SYNC      8u   // D3D11 client under Wine/Proton (#121): Wine cannot import a D3D12 fence
++                                      // made in another process, so the client opens NEITHER fence. It drains
++                                      // its own input copies on the CPU before each 'F', and the host, instead
++                                      // of Wait(fence_in), CPU-waits its own evaluate and publishes fm.n through
++                                      // the FeedCpuSync counter below, setting the done event. Every place that
++                                      // CPU-signals fence_out publishes too, so the never-hang rule holds. An old
++                                      // host ignores the bit and never sets FEED_ACK_CPU_SYNC: the client stops.
+ 
+ // FeedBuildAck::flags (v6+)
+ #define FEED_ACK_SR_ACTIVE       1u   // the feature is DLSS Super Resolution work -> target (sr_quality says which preset)
+ #define FEED_ACK_SR_UNAVAILABLE  2u   // SR was asked for, no preset covers the ratio: the build failed on purpose,
+                                       // rebuild with target == work (DLAA)
++#define FEED_ACK_CPU_SYNC        4u   // the host honours FEED_BUILD_CPU_SYNC and has created the objects below
+ #define FEED_PIPE_FMT    "\\\\.\\pipe\\dlss5-feed.%lu"   // %lu = game PID
+ 
++// FEED_BUILD_CPU_SYNC: named per game PID, created by the host, opened by the client after
++// the BuildAck. done_n only ever grows (it carries the client's frame numbers, which never
++// restart), so a respawned host that reopens an existing mapping cannot move it backwards.
++#define FEED_SYNC_MAP_FMT L"Local\\dlss5-feed-sync.%lu"
++#define FEED_SYNC_EVT_FMT L"Local\\dlss5-feed-done.%lu"
++struct FeedCpuSync
++{
++    volatile uint64_t done_n;   // newest frame whose Output the host has finished (UINT64_MAX on exit)
++};
++
+ // The bytes a version-1 client sends as its hello: magic, version, pid.
+ #define FEED_HELLO_V1_SIZE (3u * sizeof(uint32_t))
+ 

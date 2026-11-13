@@ -1,0 +1,22 @@
+# local work/output
+work/
+build/
+dl/
+*.log
+*.dmp
+__pycache__/
+*.pyc
+# never commit binaries or third-party payloads
+*.dll
+*.exe
+*.addon32
+*.addon64
+*.lib
+*.zip
+*.7z
+*.tar.*
+*.png
+*.jpg
+!docs/img/*.jpg
+.vscode/
+.idea/

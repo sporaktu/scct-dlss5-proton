@@ -1,0 +1,38 @@
+# Add these groups to ~/.config/kwinrulesrc and append their names to "Order=" in [General]
+# (e.g. Order=dlss5-feed-host,scct-game; keep any names already listed), then run
+#   qdbus6 org.kde.KWin /KWin reconfigure
+# Both rules match the window class "steam_app_13570", which is what Proton gives windows
+# launched from Steam for this game.
+# (Rules can also be created in System Settings > Window Management > Window Rules.)
+
+[dlss5-feed-host]
+Description=DLSS 5 Feed helper window: never focus, keep below (Splinter Cell Chaos Theory)
+acceptfocus=false
+acceptfocusrule=2
+below=true
+belowrule=2
+fsplevel=4
+fsplevelrule=2
+skippager=true
+skippagerrule=2
+skipswitcher=true
+skipswitcherrule=2
+skiptaskbar=true
+skiptaskbarrule=2
+title=DLSS 5 Feed host
+titlematch=2
+wmclass=steam_app_13570
+wmclassmatch=2
+
+[scct-game]
+Description=Splinter Cell Chaos Theory: borderless fullscreen, takes focus on launch
+decorationpolicy=none
+decorationpolicyrule=2
+fpplevel=0
+fpplevelrule=2
+fsplevel=0
+fsplevelrule=2
+title=Splinter Cell Chaos Theory
+titlematch=2
+wmclass=steam_app_13570
+wmclassmatch=2
