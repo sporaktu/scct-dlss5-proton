@@ -62,23 +62,35 @@ game runs, so they can be A/B'd live):
 
 ```
 Passes=2
-Style=1
-Intensity=1.75
-LocalStructure=1.75
+Style=auto
+Intensity=1.0
+LocalStructure=1.5
 LocalTone=1.0
 Pass2LocalTone=1.0
-TransferStrength=1.5
-MaxRatio=3.0
+TransferStrength=1.25
+MaxRatio=auto
 ```
+
+**Do not use `Style=1` or push `Intensity` up in this game.** An earlier version of this guide
+recommended `Style=1`, `Intensity=1.75`, `LocalStructure=1.75`, `TransferStrength=1.5`,
+`MaxRatio=3.0`. In play that put a grey haze over the picture: measured on the same frame, the
+black floor rose (1st-percentile luma 2 -> 7 of 255), mean brightness rose about 28%, highlights
+dropped and colour saturation fell by about a third. `Style=1` alone flattens contrast and
+colour; stacked with two passes and raised intensity it compounds. The values above keep tone
+and colour within a few percent of the un-processed frame while still adding surface detail.
+
+![neural pass off / old hazy settings / current settings](img/haze-off-old-new.jpg)
+
+Left: neural pass off. Middle: the old settings (hazy). Right: the current settings.
 
 What was compared, same scene, by screenshot:
 
 | Setting | Observation |
 |---|---|
 | Defaults (1 pass, all 1.0) | Mild sharpening of surfaces |
-| `Style` 0 / 1 / 2 | 1 ("natural") added the most surface detail; 2 ("cinematic") was darker with less detail |
-| 2 passes, 1.5 / 1.5 / transfer 1.25 | Clear material detail on rock, cloth and face |
-| 2 passes, 1.75 / 1.75 / transfer 1.5 | Chosen: stronger, still stable in a static scene |
+| `Style` 0 / 1 / 2 | 1 ("natural") added surface detail in a still but washes out blacks and colour (see above); 2 ("cinematic") was darker with less detail |
+| 2 passes, intensity 1.0, structure 1.5, transfer 1.25, default style | Chosen: material detail without changing tone |
+| 2 passes, 1.75 / 1.75 / transfer 1.5, style 1 | Rejected: grey haze over the image |
 | 3 passes, 2.0 / 2.0 / transfer 2.0 | Most detail, starts to look processed; about 51 fps at Shader Model 1.1 |
 | `WorkingScale` 0.75 / 0.67 | Only about 54 -> 62 fps, so left at 1.0 |
 

@@ -33,10 +33,10 @@ python3 scripts/patchini.py "$GAME/System/host64/OptiScaler.ini" \
 | Section | Key | Value |
 |---|---|---|
 | `[DlssNr]` | `Passes` | `2` |
-| `[DlssNr]` | `Style` | `1` |
-| `[DlssNr]` | `Intensity` | `1.75` |
-| `[DlssNr]` | `LocalStructure` | `1.75` |
+| `[DlssNr]` | `Style` | `auto` |
+| `[DlssNr]` | `Intensity` | `1.0` |
+| `[DlssNr]` | `LocalStructure` | `1.5` |
 | `[DlssNr]` | `LocalTone` | `1.0` |
 | `[DlssNr]` | `Pass2LocalTone` | `1.0` |
-| `[DlssNr]` | `TransferStrength` | `1.5` |
-| `[DlssNr]` | `MaxRatio` | `3.0` |
+| `[DlssNr]` | `TransferStrength` | `1.25` |
+| `[DlssNr]` | `MaxRatio` | `auto` |
