@@ -5,6 +5,9 @@ result look clearly better, in the order they mattered. Measured on an RTX 5090 
 
 ![Game alone (left) vs. with the tuned DLSS 5 neural pass (right), Shader Model 3.0](img/off-vs-on.jpg)
 
+*This first comparison was captured with the earlier, stronger neural settings that turned out to
+haze the picture in play; see section 4 for the corrected values and a three-way comparison.*
+
 *Left: the game with Shader Model 3.0, neural pass off. Right: same frame position with the tuned
 neural pass. Crop of a 3840x2160 capture.*
 
